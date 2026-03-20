@@ -465,7 +465,7 @@ def run_ollama_prompt(
     start_perf = time.perf_counter()
     start_proc = _snapshot_ollama_process_tree()
 
-    options: Dict[str, Any] = {"main_gpu": gpu_device}
+    options: Dict[str, Any] = {"main_gpu": gpu_device, "temperature": 0.0}
     if gpu_layers is not None:
         options["num_gpu"] = gpu_layers
     payload = {"model": model, "prompt": prompt, "stream": True, "options": options}
