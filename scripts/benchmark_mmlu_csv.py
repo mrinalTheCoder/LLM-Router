@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 NANOSECONDS_TO_SECONDS = 1e-9
 CHOICE_LABELS = ("A", "B", "C", "D")
-FINAL_ANSWER_RE = re.compile(r"^(?:ANSWER\s*:\s*)?([ABCD])\s*$", re.IGNORECASE)
+SIMPLE_ANSWER_RE = re.compile(r"^\s*([ABCD])\s*$", re.IGNORECASE)
 
 
 def _load_mmlu_rows_with_polars(
@@ -54,26 +54,22 @@ def _truth_letter(answer: Any) -> str:
 def build_reasoning_prompt(question: str, choices: Sequence[str]) -> str:
     lines = [
         "You are solving a multiple-choice question.",
-        "You may reason in your response.",
-        "Your last line must be exactly: ANSWER: <A|B|C|D>",
+        "Respond with only one character: A, B, C, or D.",
+        "Do not include any explanation or extra text.",
         "",
         f"Question: {question}",
     ]
     for label, choice in zip(CHOICE_LABELS, choices):
         lines.append(f"{label}. {choice}")
-    lines.extend(["", "Think step by step, then provide the final line in the required format."])
+    lines.extend(["", "Final answer:"])
     return "\n".join(lines)
 
 
-def _extract_last_line_answer(text: str) -> Optional[str]:
-    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not non_empty_lines:
-        return None
-    last_line = non_empty_lines[-1]
-    match = FINAL_ANSWER_RE.match(last_line)
+def _parse_simple_answer(text: str) -> Tuple[Optional[str], bool]:
+    match = SIMPLE_ANSWER_RE.match(text)
     if not match:
-        return None
-    return match.group(1).upper()
+        return (None, False)
+    return (match.group(1).upper(), True)
 
 
 def _sample_nvidia_gpu_power_watts(gpu_device: int) -> Optional[float]:
@@ -304,12 +300,20 @@ def benchmark_to_csv(
     gpu_device: int = 0,
     power_sample_interval_s: float = 0.1,
 ) -> Dict[str, Any]:
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency: 'tqdm'. Install with `pip install tqdm`."
+        ) from exc
+
     rows = _load_mmlu_rows_with_polars(dataset_name, dataset_config, split, limit)
     csv_rows: List[Dict[str, Any]] = []
     correct = 0
-    valid_last_line = 0
+    valid_answer_format = 0
 
-    for idx, example in enumerate(rows):
+    progress = tqdm(rows, total=len(rows), desc="Benchmarking MMLU", unit="q")
+    for idx, example in enumerate(progress):
         choices = example.get("choices")
         if not isinstance(choices, (list, tuple)) or len(choices) < 4:
             raise ValueError(f"Unexpected choices at row {idx}: {choices!r}")
@@ -324,13 +328,18 @@ def benchmark_to_csv(
             gpu_device=gpu_device,
             power_sample_interval_s=power_sample_interval_s,
         )
-        predicted = _extract_last_line_answer(metrics["response_text"])
-        is_last_line_valid = predicted is not None
-        is_correct = bool(predicted == truth) if is_last_line_valid else False
-        if is_last_line_valid:
-            valid_last_line += 1
+        predicted, is_valid_format = _parse_simple_answer(metrics["response_text"])
+        is_correct = bool(predicted == truth) if is_valid_format else False
+        if is_valid_format:
+            valid_answer_format += 1
         if is_correct:
             correct += 1
+
+        progress.set_postfix(
+            correct=correct,
+            wrong=(idx + 1 - correct),
+            valid_format=valid_answer_format,
+        )
 
         csv_rows.append(
             {
@@ -342,8 +351,9 @@ def benchmark_to_csv(
                 "choice_c": choices[2],
                 "choice_d": choices[3],
                 "truth": truth,
-                "predicted_last_line": predicted,
-                "last_line_valid": is_last_line_valid,
+                "predicted_final_answer": predicted,
+                "answer_format_valid": is_valid_format,
+                "answer_format_failure": not is_valid_format,
                 "result": "correct" if is_correct else "wrong",
                 "is_correct": is_correct,
                 "ttft_s": metrics["ttft_s"],
@@ -381,8 +391,8 @@ def benchmark_to_csv(
         "evaluated_examples": total,
         "correct_predictions": correct,
         "accuracy": correct / total if total else 0.0,
-        "valid_last_line_predictions": valid_last_line,
-        "valid_last_line_rate": valid_last_line / total if total else 0.0,
+        "valid_answer_format_predictions": valid_answer_format,
+        "valid_answer_format_rate": valid_answer_format / total if total else 0.0,
     }
 
 
