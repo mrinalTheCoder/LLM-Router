@@ -10,6 +10,7 @@ python scripts/train_router_ppo.py \
   --val-limit 128 \
   --total-timesteps 5000 \
   --learning-rate 3e-4 \
+  --encoder-training-mode frozen \
   --reward-alpha 1.0 \
   --reward-beta 0.2 \
   --reward-gamma 0.2 \
@@ -27,7 +28,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -40,8 +41,16 @@ except ImportError as exc:
     ) from exc
 
 try:
+    import torch
+except ImportError as exc:
+    raise RuntimeError(
+        "Missing dependency: torch. Install requirements before running training."
+    ) from exc
+
+try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
     from stable_baselines3.common.vec_env import DummyVecEnv
 except ImportError as exc:
     raise RuntimeError(
@@ -62,6 +71,7 @@ from benchmark_mmlu_csv import run_ollama_prompt
 
 CHOICE_LABELS = ("A", "B", "C", "D")
 ANSWER_RE = re.compile(r"\b([ABCD])\b")
+ENCODER_MODE_CHOICES = ("frozen", "finetune")
 
 
 @dataclass(frozen=True)
@@ -206,6 +216,133 @@ class OnlineOllamaProvider:
         )
 
 
+RouterObservation = Union[np.ndarray, Dict[str, np.ndarray]]
+ObservationData = Union[np.ndarray, Dict[str, np.ndarray]]
+
+
+class ObservationStore:
+    """Container that abstracts frozen vector obs vs tokenized dict obs."""
+
+    def __init__(self, data: ObservationData):
+        if isinstance(data, np.ndarray):
+            if data.ndim != 2:
+                raise ValueError(
+                    "Embedding observations must be a 2D array of shape (N, D)."
+                )
+            self.kind = "embedding"
+            self.data: ObservationData = data.astype(np.float32, copy=False)
+            obs_dim = int(data.shape[1])
+            self.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            )
+            self._zero_observation: RouterObservation = np.zeros(
+                (obs_dim,), dtype=np.float32
+            )
+            return
+
+        if not isinstance(data, dict):
+            raise ValueError("ObservationStore expects either ndarray or dict observations.")
+
+        input_ids = np.asarray(data.get("input_ids"), dtype=np.int64)
+        attention_mask = np.asarray(data.get("attention_mask"), dtype=np.int64)
+        if input_ids.ndim != 2:
+            raise ValueError(
+                "Token observations must provide input_ids with shape (N, T)."
+            )
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must match input_ids shape.")
+
+        self.kind = "tokenized"
+        self.data = {"input_ids": input_ids, "attention_mask": attention_mask}
+        seq_len = int(input_ids.shape[1])
+        self.observation_space = spaces.Dict(
+            {
+                "input_ids": spaces.Box(
+                    low=0,
+                    high=np.iinfo(np.int32).max,
+                    shape=(seq_len,),
+                    dtype=np.int64,
+                ),
+                "attention_mask": spaces.Box(
+                    low=0,
+                    high=1,
+                    shape=(seq_len,),
+                    dtype=np.int64,
+                ),
+            }
+        )
+        self._zero_observation = {
+            "input_ids": np.zeros((seq_len,), dtype=np.int64),
+            "attention_mask": np.zeros((seq_len,), dtype=np.int64),
+        }
+
+    def __len__(self) -> int:
+        if self.kind == "embedding":
+            return int(self.data.shape[0])  # type: ignore[union-attr]
+        input_ids = self.data["input_ids"]  # type: ignore[index]
+        return int(input_ids.shape[0])
+
+    def get(self, idx: int) -> RouterObservation:
+        if self.kind == "embedding":
+            return np.asarray(self.data[idx], dtype=np.float32).copy()  # type: ignore[index]
+        return {
+            key: np.asarray(value[idx], dtype=np.int64).copy()
+            for key, value in self.data.items()  # type: ignore[union-attr]
+        }
+
+    def zero(self) -> RouterObservation:
+        if self.kind == "embedding":
+            return np.asarray(self._zero_observation, dtype=np.float32).copy()
+        return {
+            key: np.asarray(value, dtype=np.int64).copy()
+            for key, value in self._zero_observation.items()  # type: ignore[union-attr]
+        }
+
+    def subset(self, length: int) -> "ObservationStore":
+        if self.kind == "embedding":
+            return ObservationStore(self.data[:length])  # type: ignore[index]
+        return ObservationStore(
+            {
+                key: value[:length]
+                for key, value in self.data.items()  # type: ignore[union-attr]
+            }
+        )
+
+
+class TransformerClsFeaturesExtractor(BaseFeaturesExtractor):
+    """Shared encoder used by PPO when encoder_training_mode=finetune."""
+
+    def __init__(self, observation_space: spaces.Dict, encoder_name: str):
+        super().__init__(observation_space, features_dim=1)
+        try:
+            from transformers import AutoModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing dependency: transformers. Install requirements before running training."
+            ) from exc
+
+        self.encoder = AutoModel.from_pretrained(encoder_name)
+        hidden_size = getattr(self.encoder.config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(
+                f"Encoder {encoder_name!r} does not expose config.hidden_size."
+            )
+        self._features_dim = int(hidden_size)
+
+    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
+        input_ids = observations["input_ids"].long()
+        attention_mask = observations["attention_mask"].long()
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if last_hidden_state is None:
+            raise RuntimeError("Transformer encoder did not return last_hidden_state.")
+        return last_hidden_state[:, 0, :]
+
+
 class RouterBanditEnv(gym.Env):
     """Single-step contextual bandit environment for model routing."""
 
@@ -214,7 +351,7 @@ class RouterBanditEnv(gym.Env):
     def __init__(
         self,
         records: Sequence[PromptRecord],
-        embeddings: np.ndarray,
+        observations: ObservationStore,
         model_pool: Sequence[str],
         provider: OutcomeProvider,
         reward_config: RewardConfig,
@@ -223,34 +360,30 @@ class RouterBanditEnv(gym.Env):
         super().__init__()
         if len(records) == 0:
             raise ValueError("RouterBanditEnv requires at least one prompt record.")
-        if embeddings.shape[0] != len(records):
-            raise ValueError("Embeddings row count must equal number of prompt records.")
+        if len(observations) != len(records):
+            raise ValueError("Observation row count must equal number of prompt records.")
         if len(model_pool) < 2:
             raise ValueError("Model pool must contain at least two candidate models.")
 
         self.records = list(records)
-        self.embeddings = embeddings.astype(np.float32, copy=False)
+        self.observations = observations
         self.model_pool = list(model_pool)
         self.provider = provider
         self.reward_config = reward_config
         self._rng = np.random.default_rng(seed)
         self._current_index: Optional[int] = None
-        obs_dim = int(self.embeddings.shape[1])
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
-        )
+        self.observation_space = self.observations.observation_space
         self.action_space = spaces.Discrete(len(self.model_pool))
-        self._zero_obs = np.zeros((obs_dim,), dtype=np.float32)
 
     def reset(
         self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    ) -> Tuple[RouterObservation, Dict[str, Any]]:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         self._current_index = int(self._rng.integers(0, len(self.records)))
         record = self.records[self._current_index]
         info = {"prompt_id": record.prompt_id, "subject": record.subject}
-        return self.embeddings[self._current_index], info
+        return self.observations.get(self._current_index), info
 
     def step(self, action: int):
         if self._current_index is None:
@@ -299,21 +432,21 @@ class RouterBanditEnv(gym.Env):
         self._current_index = None
         terminated = True
         truncated = False
-        return self._zero_obs, reward_parts["reward_total"], terminated, truncated, info
+        return self.observations.zero(), reward_parts["reward_total"], terminated, truncated, info
 
 
 class RouterEvaluator:
     def __init__(
         self,
         records: Sequence[PromptRecord],
-        embeddings: np.ndarray,
+        observations: ObservationStore,
         model_pool: Sequence[str],
         provider: OutcomeProvider,
         reward_config: RewardConfig,
         limit: Optional[int] = None,
     ) -> None:
         self.records = list(records[:limit] if limit is not None else records)
-        self.embeddings = embeddings[: len(self.records)]
+        self.observations = observations.subset(len(self.records))
         self.model_pool = list(model_pool)
         self.provider = provider
         self.reward_config = reward_config
@@ -339,7 +472,7 @@ class RouterEvaluator:
         model_total_counter = Counter()
 
         for idx, record in enumerate(self.records):
-            obs = self.embeddings[idx]
+            obs = self.observations.get(idx)
             action, _ = model.predict(obs, deterministic=True)
             action_idx = int(action)
             selected_model = self.model_pool[action_idx]
@@ -631,6 +764,54 @@ def compute_embeddings(
     return np.asarray(vectors, dtype=np.float32)
 
 
+def load_transformers_tokenizer(encoder_name: str):
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency: transformers. Install requirements before running training."
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(encoder_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        fallback_pad_token = tokenizer.eos_token or tokenizer.unk_token
+        if fallback_pad_token is None:
+            raise ValueError(
+                f"Encoder tokenizer {encoder_name!r} has no pad, eos, or unk token."
+            )
+        tokenizer.pad_token = fallback_pad_token
+    return tokenizer
+
+
+def compute_tokenized_observations(
+    records: Sequence[PromptRecord],
+    tokenizer: Any,
+    max_length: int,
+) -> ObservationStore:
+    texts = [record.router_text for record in records]
+    encoded = tokenizer(
+        texts,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_attention_mask=True,
+        return_tensors="np",
+    )
+    input_ids = np.asarray(encoded["input_ids"], dtype=np.int64)
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is None:
+        if tokenizer.pad_token_id is None:
+            attention_mask = np.ones_like(input_ids, dtype=np.int64)
+        else:
+            attention_mask = (input_ids != int(tokenizer.pad_token_id)).astype(np.int64)
+    return ObservationStore(
+        {
+            "input_ids": input_ids,
+            "attention_mask": np.asarray(attention_mask, dtype=np.int64),
+        }
+    )
+
+
 def parse_model_pool(raw: str) -> List[str]:
     if isinstance(raw, str):
         models = [item.strip() for item in raw.split(",") if item.strip()]
@@ -653,6 +834,42 @@ def parse_hidden_sizes(raw: Any, *, arg_name: str) -> List[int]:
     if not sizes:
         raise ValueError(f"At least one hidden layer size is required for {arg_name}.")
     return sizes
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.encoder_training_mode not in ENCODER_MODE_CHOICES:
+        raise ValueError(
+            "encoder_training_mode must be specified for every run and be one of: "
+            + ", ".join(ENCODER_MODE_CHOICES)
+        )
+    if args.encoder_max_length <= 0:
+        raise ValueError("encoder_max_length must be a positive integer.")
+    if args.encoder_training_mode == "finetune" and args.embedding_normalize:
+        raise ValueError(
+            "--embedding-normalize is only supported with encoder-training-mode=frozen."
+        )
+
+
+def build_observation_store(
+    records: Sequence[PromptRecord], args: argparse.Namespace
+) -> ObservationStore:
+    if args.encoder_training_mode == "frozen":
+        return ObservationStore(
+            compute_embeddings(
+                records,
+                encoder_name=args.encoder_name,
+                encoder_device=args.encoder_device,
+                batch_size=args.embedding_batch_size,
+                normalize=args.embedding_normalize,
+            )
+        )
+
+    tokenizer = load_transformers_tokenizer(args.encoder_name)
+    return compute_tokenized_observations(
+        records,
+        tokenizer=tokenizer,
+        max_length=args.encoder_max_length,
+    )
 
 
 def set_global_seeds(seed: int) -> None:
@@ -798,28 +1015,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--n-envs", type=int, default=1, help="Number of vectorized envs.")
     parser.add_argument("--ppo-device", default="auto", help="SB3 torch device.")
+    parser.add_argument(
+        "--encoder-training-mode",
+        choices=ENCODER_MODE_CHOICES,
+        default=None,
+        help="Required per run: use frozen precomputed embeddings or end-to-end finetuning.",
+    )
 
     parser.add_argument(
         "--encoder-name",
         default="sentence-transformers/all-MiniLM-L6-v2",
-        help="Sentence-transformers encoder for router state features.",
+        help="Encoder checkpoint for frozen embeddings or fine-tunable transformer features.",
     )
     parser.add_argument(
         "--encoder-device",
         default="cpu",
-        help="Encoder device, e.g. cpu, cuda, cuda:0.",
+        help="Encoder device for frozen embedding precomputation.",
+    )
+    parser.add_argument(
+        "--encoder-max-length",
+        type=int,
+        default=256,
+        help="Maximum token length used when encoder-training-mode=finetune.",
     )
     parser.add_argument(
         "--embedding-batch-size",
         type=int,
         default=64,
-        help="Embedding batch size for prompt encoding.",
+        help="Embedding batch size for frozen prompt encoding.",
     )
     parser.add_argument(
         "--embedding-normalize",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Normalize sentence embeddings before PPO.",
+        help="Normalize sentence embeddings before PPO in frozen mode.",
     )
 
     parser.add_argument(
@@ -869,6 +1098,7 @@ def parse_args_with_yaml(parser: argparse.ArgumentParser) -> argparse.Namespace:
 def main() -> None:
     parser = build_arg_parser()
     args = parse_args_with_yaml(parser)
+    validate_args(args)
     set_global_seeds(args.seed)
 
     output_dir = Path(args.output_dir)
@@ -896,20 +1126,8 @@ def main() -> None:
     if len(train_records) == 0:
         raise RuntimeError("No training records loaded.")
 
-    train_embeddings = compute_embeddings(
-        train_records,
-        encoder_name=args.encoder_name,
-        encoder_device=args.encoder_device,
-        batch_size=args.embedding_batch_size,
-        normalize=args.embedding_normalize,
-    )
-    val_embeddings = compute_embeddings(
-        val_records,
-        encoder_name=args.encoder_name,
-        encoder_device=args.encoder_device,
-        batch_size=args.embedding_batch_size,
-        normalize=args.embedding_normalize,
-    )
+    train_observations = build_observation_store(train_records, args)
+    val_observations = build_observation_store(val_records, args)
 
     reward_config = RewardConfig(
         alpha=args.reward_alpha,
@@ -931,7 +1149,7 @@ def main() -> None:
             provider = OnlineOllamaProvider(provider_config)
             return RouterBanditEnv(
                 records=train_records,
-                embeddings=train_embeddings,
+                observations=train_observations,
                 model_pool=model_pool,
                 provider=provider,
                 reward_config=reward_config,
@@ -943,8 +1161,17 @@ def main() -> None:
     env = DummyVecEnv([make_env(args.seed + i) for i in range(args.n_envs)])
 
     policy_kwargs = {"net_arch": {"pi": actor_hidden_sizes, "vf": critic_hidden_sizes}}
+    policy_name = "MlpPolicy"
+    if args.encoder_training_mode == "finetune":
+        policy_name = "MultiInputPolicy"
+        policy_kwargs.update(
+            {
+                "features_extractor_class": TransformerClsFeaturesExtractor,
+                "features_extractor_kwargs": {"encoder_name": args.encoder_name},
+            }
+        )
     ppo_model = PPO(
-        "MlpPolicy",
+        policy_name,
         env,
         learning_rate=args.learning_rate,
         n_steps=args.n_steps,
@@ -986,7 +1213,7 @@ def main() -> None:
         eval_provider = OnlineOllamaProvider(provider_config)
         eval_runner = RouterEvaluator(
             records=val_records,
-            embeddings=val_embeddings,
+            observations=val_observations,
             model_pool=model_pool,
             provider=eval_provider,
             reward_config=reward_config,
@@ -1018,6 +1245,9 @@ def main() -> None:
         "train_records": len(train_records),
         "val_records": len(val_records),
         "model_pool": model_pool,
+        "encoder_training_mode": args.encoder_training_mode,
+        "encoder_name": args.encoder_name,
+        "encoder_max_length": args.encoder_max_length,
     }
 
     if eval_runner is not None:
