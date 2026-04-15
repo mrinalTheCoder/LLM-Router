@@ -17,7 +17,7 @@ The script logs full training/evaluation metrics to Weights & Biases (W&B), incl
    - Builds prompt records (`question`, 4 choices, truth label).
 
 2. **State encoder**
-   - Uses SentenceTransformers encoder (default: `all-MiniLM-L6-v2`) to generate router observation vectors.
+   - Uses a shared, frozen SentenceTransformers encoder (default: `all-MiniLM-L6-v2`) to generate a 384-d router observation vector for each prompt.
 
 3. **Outcome provider abstraction**
    - `OutcomeProvider` protocol defines `query(prompt, model_name) -> ModelOutcome`.
@@ -33,6 +33,10 @@ The script logs full training/evaluation metrics to Weights & Biases (W&B), incl
 
 5. **Trainer**
    - Uses Stable-Baselines3 PPO (`MlpPolicy`) over the bandit environment.
+   - The PPO policy consumes the 384-d MiniLM embedding directly and uses split heads:
+     - Actor MLP: `384 -> 256 -> 128 -> |model_pool|`
+     - Critic MLP: `384 -> 256 -> 64 -> 1`
+   - With the default 8-model pool, the actor head outputs 8 action logits.
    - Supports checkpointing and periodic deterministic validation.
 
 6. **Logging and artifacts**
@@ -80,7 +84,7 @@ When YAML is provided, values are loaded as parser defaults, then CLI is parsed.
 - `n_steps`, `batch_size`, `ppo_epochs`
 - `gamma_rl`, `gae_lambda`, `clip_range`
 - `ent_coef`, `vf_coef`, `max_grad_norm`
-- `policy_hidden_sizes`, `n_envs`, `ppo_device`
+- `actor_hidden_sizes`, `critic_hidden_sizes`, `n_envs`, `ppo_device`
 
 ### 4.5 Encoder
 - `encoder_name`, `encoder_device`
@@ -158,7 +162,8 @@ total_timesteps: 5000
 n_steps: 256
 batch_size: 64
 ppo_epochs: 10
-policy_hidden_sizes: [256, 256, 128]
+actor_hidden_sizes: [256, 128]
+critic_hidden_sizes: [256, 64]
 
 encoder_name: sentence-transformers/all-MiniLM-L6-v2
 encoder_device: cpu

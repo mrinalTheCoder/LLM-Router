@@ -643,15 +643,15 @@ def parse_model_pool(raw: str) -> List[str]:
     return models
 
 
-def parse_hidden_sizes(raw: Any) -> List[int]:
+def parse_hidden_sizes(raw: Any, *, arg_name: str) -> List[int]:
     if isinstance(raw, str):
         sizes = [int(item.strip()) for item in raw.split(",") if item.strip()]
     elif isinstance(raw, (list, tuple)):
         sizes = [int(item) for item in raw]
     else:
-        raise ValueError(f"Unsupported policy-hidden-sizes value: {raw!r}")
+        raise ValueError(f"Unsupported {arg_name} value: {raw!r}")
     if not sizes:
-        raise ValueError("At least one hidden layer size is required.")
+        raise ValueError(f"At least one hidden layer size is required for {arg_name}.")
     return sizes
 
 
@@ -787,9 +787,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vf-coef", type=float, default=0.5, help="Value loss coefficient.")
     parser.add_argument("--max-grad-norm", type=float, default=0.5, help="Max grad norm.")
     parser.add_argument(
-        "--policy-hidden-sizes",
-        default="256,256,128",
-        help="Comma-separated hidden sizes for actor/critic MLP.",
+        "--actor-hidden-sizes",
+        default="256,128",
+        help="Comma-separated hidden sizes for the actor head MLP.",
+    )
+    parser.add_argument(
+        "--critic-hidden-sizes",
+        default="256,64",
+        help="Comma-separated hidden sizes for the critic head MLP.",
     )
     parser.add_argument("--n-envs", type=int, default=1, help="Number of vectorized envs.")
     parser.add_argument("--ppo-device", default="auto", help="SB3 torch device.")
@@ -869,7 +874,12 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_pool = parse_model_pool(args.model_pool)
-    hidden_sizes = parse_hidden_sizes(args.policy_hidden_sizes)
+    actor_hidden_sizes = parse_hidden_sizes(
+        args.actor_hidden_sizes, arg_name="actor_hidden_sizes"
+    )
+    critic_hidden_sizes = parse_hidden_sizes(
+        args.critic_hidden_sizes, arg_name="critic_hidden_sizes"
+    )
 
     train_records = load_mmlu_records(
         dataset_name=args.dataset,
@@ -932,7 +942,7 @@ def main() -> None:
 
     env = DummyVecEnv([make_env(args.seed + i) for i in range(args.n_envs)])
 
-    policy_kwargs = {"net_arch": hidden_sizes}
+    policy_kwargs = {"net_arch": {"pi": actor_hidden_sizes, "vf": critic_hidden_sizes}}
     ppo_model = PPO(
         "MlpPolicy",
         env,
