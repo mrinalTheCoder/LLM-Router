@@ -13,4 +13,4 @@ conda activate llm-router
 
 srun scripts/run_single_llm_outputs.sh --model "llama3-chatqa:8b"
 srun scripts/run_single_llm_outputs.sh --model "llama3.2:3b"
-srun scripts/run_single_llm_outputs.sh --model "qwen2.5:3b"
+srun scripts/run_single_llm_outputs.sh --model "qwen2.5:7b"

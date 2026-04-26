@@ -1,9 +1,9 @@
 # `train_router_ppo.py` Specification
 
 ## 1. Purpose
-`scripts/train_router_ppo.py` trains an **online PPO routing policy** that selects one model from a candidate pool for each MMLU prompt.
+`scripts/train_router_ppo.py` trains a **PPO routing policy** that selects one model from a candidate pool for each MMLU prompt.
 
-Each policy action triggers a **live model query** and computes reward from:
+Each policy action receives an outcome from either cached benchmark CSVs or a live model query and computes reward from:
 
 `reward = alpha * correct - beta * normalized_latency - gamma * normalized_energy`
 
@@ -23,8 +23,8 @@ The script logs full training/evaluation metrics to Weights & Biases (W&B), incl
 
 3. **Outcome provider abstraction**
    - `OutcomeProvider` protocol defines `query(prompt, model_name) -> ModelOutcome`.
-   - `OnlineOllamaProvider` is the current implementation (live Ollama query + telemetry).
-   - Future cache/database providers can implement the same protocol with no trainer-loop changes.
+   - `CachedOutcomeProvider` loads existing `model_outputs/<model>-<split>.csv` files.
+   - `OnlineOllamaProvider` performs live Ollama query + telemetry collection.
 
 4. **Bandit environment**
    - `RouterBanditEnv` is a single-step contextual bandit:
@@ -80,6 +80,8 @@ When YAML is provided, values are loaded as parser defaults, then CLI is parsed.
 
 ### 4.2 Model routing
 - `model_pool` (comma string or YAML list)
+- `outcome_source` (`cached` or `online`)
+- `cached_output_dir` (used when `outcome_source: cached`)
 - `host`, `timeout`, `gpu_layers`, `gpu_device`, `power_sample_interval`
 
 ### 4.3 Reward shaping
@@ -159,8 +161,10 @@ val_limit: 128
 
 model_pool:
   - llama3.2:3b
-  - qwen2.5:3b
-  - granite3.3:8b
+  - qwen2.5:7b
+  - granite4:3b
+outcome_source: cached
+cached_output_dir: model_outputs
 
 reward:
   alpha: 1.0

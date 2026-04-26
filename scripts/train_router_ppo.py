@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train an online LLM-router policy with PPO and full W&B logging.
+"""Train an LLM-router policy with PPO and full W&B logging.
 
-This script is online-first: every action chooses a model, performs a live query, and
-uses returned metrics (correctness, latency, energy, telemetry) for reward and logging.
+Each action chooses a model and receives correctness/latency/energy telemetry from
+either cached MMLU CSV outputs or live Ollama inference.
 
 Example:
 python scripts/train_router_ppo.py \
@@ -14,7 +14,9 @@ python scripts/train_router_ppo.py \
   --reward-alpha 1.0 \
   --reward-beta 0.2 \
   --reward-gamma 0.2 \
-  --model-pool "llama3.2:3b,qwen2.5:3b,granite3.3:8b" \
+  --model-pool "llama3.2:3b,qwen2.5:7b,granite4:3b" \
+  --outcome-source cached \
+  --cached-output-dir model_outputs \
   --wandb-project llm-router \
   --wandb-mode online
 """
@@ -22,9 +24,11 @@ python scripts/train_router_ppo.py \
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import re
+import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,6 +76,10 @@ from benchmark_mmlu_csv import run_ollama_prompt
 CHOICE_LABELS = ("A", "B", "C", "D")
 ANSWER_RE = re.compile(r"\b([ABCD])\b")
 ENCODER_MODE_CHOICES = ("frozen", "finetune")
+OUTCOME_SOURCE_CHOICES = ("cached", "online")
+ROUTER_ARCHITECTURE_NAME = "proposal_encoder_3layer_mlp"
+DEFAULT_ACTOR_HIDDEN_SIZES = (256, 128)
+DEFAULT_CRITIC_HIDDEN_SIZES = (256, 64)
 
 
 @dataclass(frozen=True)
@@ -156,8 +164,8 @@ class ModelOutcome:
 class OutcomeProvider(Protocol):
     """Provider abstraction for model outcomes.
 
-    Online provider is used now; a cache/database provider can implement this same
-    interface later without changing the training loop.
+    Cached CSV and online Ollama providers share this interface so the training loop
+    does not need to know where outcomes came from.
     """
 
     def query(self, prompt: PromptRecord, model_name: str) -> ModelOutcome:
@@ -214,6 +222,103 @@ class OnlineOllamaProvider:
             gpu_power_min_watts=to_opt_float(metrics.get("gpu_power_min_watts")),
             gpu_power_max_watts=to_opt_float(metrics.get("gpu_power_max_watts")),
         )
+
+
+@dataclass(frozen=True)
+class CachedProviderConfig:
+    output_dir: Path
+    split: str
+
+
+class CachedOutcomeStore:
+    """Loaded benchmark CSV outcomes for one MMLU split."""
+
+    def __init__(
+        self,
+        config: CachedProviderConfig,
+        outcomes_by_model: Dict[str, Dict[int, ModelOutcome]],
+    ):
+        self.config = config
+        self.outcomes_by_model = outcomes_by_model
+
+    @classmethod
+    def from_dir(
+        cls,
+        config: CachedProviderConfig,
+        model_pool: Sequence[str],
+        required_prompt_ids: Optional[Sequence[int]] = None,
+    ) -> "CachedOutcomeStore":
+        output_dir = Path(config.output_dir)
+        if not output_dir.exists():
+            raise FileNotFoundError(f"Cached output directory not found: {output_dir}")
+        if not output_dir.is_dir():
+            raise NotADirectoryError(f"Cached output path is not a directory: {output_dir}")
+
+        required_ids = (
+            set(int(prompt_id) for prompt_id in required_prompt_ids)
+            if required_prompt_ids is not None
+            else None
+        )
+        _set_csv_field_size_limit()
+
+        outcomes_by_model: Dict[str, Dict[int, ModelOutcome]] = {}
+        for model_name in model_pool:
+            csv_path = output_dir / f"{model_name}-{config.split}.csv"
+            if not csv_path.exists():
+                available = ", ".join(
+                    sorted(path.name for path in output_dir.glob(f"*-{config.split}.csv"))
+                )
+                raise FileNotFoundError(
+                    f"Cached outcomes missing for model={model_name!r}, "
+                    f"split={config.split!r}: {csv_path}. Available for split: {available}"
+                )
+            outcomes_by_model[model_name] = _load_cached_model_outcomes(
+                csv_path=csv_path,
+                model_name=model_name,
+                required_prompt_ids=required_ids,
+            )
+
+        return cls(config=config, outcomes_by_model=outcomes_by_model)
+
+    def get(self, model_name: str, prompt_id: int) -> ModelOutcome:
+        model_outcomes = self.outcomes_by_model.get(model_name)
+        if model_outcomes is None:
+            raise KeyError(
+                f"No cached outcomes loaded for model {model_name!r} "
+                f"on split {self.config.split!r}."
+            )
+        outcome = model_outcomes.get(prompt_id)
+        if outcome is None:
+            raise KeyError(
+                f"No cached outcome for model {model_name!r}, prompt_id={prompt_id}, "
+                f"split={self.config.split!r}."
+            )
+        return outcome
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "output_dir": str(self.config.output_dir),
+            "split": self.config.split,
+            "row_counts_by_model": {
+                model_name: len(outcomes)
+                for model_name, outcomes in self.outcomes_by_model.items()
+            },
+        }
+
+
+class CachedOutcomeProvider:
+    def __init__(self, store: CachedOutcomeStore):
+        self.store = store
+
+    def query(self, prompt: PromptRecord, model_name: str) -> ModelOutcome:
+        outcome = self.store.get(model_name, prompt.prompt_id)
+        if outcome.truth != prompt.truth:
+            raise ValueError(
+                f"Cached truth mismatch for split={self.store.config.split!r}, "
+                f"prompt_id={prompt.prompt_id}: cache={outcome.truth!r}, "
+                f"dataset={prompt.truth!r}."
+            )
+        return outcome
 
 
 RouterObservation = Union[np.ndarray, Dict[str, np.ndarray]]
@@ -667,6 +772,127 @@ def to_opt_float(value: Any) -> Optional[float]:
         return None
 
 
+def _set_csv_field_size_limit() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
+
+
+def _parse_cached_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _parse_cached_answer_letter(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if text in CHOICE_LABELS:
+        return text
+    return None
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _load_cached_model_outcomes(
+    *,
+    csv_path: Path,
+    model_name: str,
+    required_prompt_ids: Optional[set[int]],
+) -> Dict[int, ModelOutcome]:
+    outcomes: Dict[int, ModelOutcome] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"Cached outcome CSV has no header: {csv_path}")
+        required_columns = {"index", "truth", "is_correct", "total_latency_s"}
+        missing_columns = required_columns - set(reader.fieldnames)
+        if missing_columns:
+            raise ValueError(
+                f"Cached outcome CSV {csv_path} is missing required columns: "
+                + ", ".join(sorted(missing_columns))
+            )
+
+        for row in reader:
+            prompt_id = int(row["index"])
+            if required_prompt_ids is not None and prompt_id not in required_prompt_ids:
+                continue
+            if prompt_id in outcomes:
+                raise ValueError(
+                    f"Duplicate cached outcome for model={model_name!r}, "
+                    f"prompt_id={prompt_id}, csv={csv_path}."
+                )
+
+            truth = _parse_cached_answer_letter(row.get("truth"))
+            if truth is None:
+                raise ValueError(
+                    f"Unsupported cached truth value for model={model_name!r}, "
+                    f"prompt_id={prompt_id}: {row.get('truth')!r}"
+                )
+            predicted = _parse_cached_answer_letter(row.get("predicted_final_answer"))
+            correct = _parse_cached_bool(row.get("is_correct"))
+            if correct is None:
+                correct = bool(predicted == truth) if predicted is not None else False
+
+            outcomes[prompt_id] = ModelOutcome(
+                model_name=model_name,
+                response_text="",
+                predicted=predicted,
+                truth=truth,
+                correct=int(correct),
+                latency_s=to_opt_float(row.get("total_latency_s")),
+                ttft_s=to_opt_float(row.get("ttft_s")),
+                wall_tokens_per_s=to_opt_float(row.get("wall_tokens_per_s")),
+                eval_tokens_per_s=to_opt_float(
+                    row.get("eval_tokens_per_s") or row.get("tokens_per_sec")
+                ),
+                prompt_eval_tokens_per_s=to_opt_float(row.get("prompt_eval_tokens_per_s")),
+                energy_joules=to_opt_float(row.get("energy_joules")),
+                energy_source=_optional_text(row.get("energy_source")),
+                average_power_watts=to_opt_float(row.get("average_power_watts")),
+                cpu_percent=to_opt_float(row.get("cpu_percent")),
+                cpu_effort_cpu_seconds=to_opt_float(row.get("cpu_effort_cpu_seconds")),
+                rss_delta_bytes=to_opt_float(row.get("rss_delta_bytes")),
+                gpu_utilization_avg_pct=to_opt_float(row.get("gpu_utilization_avg_pct")),
+                gpu_vram_used_avg_mib=to_opt_float(row.get("gpu_vram_used_avg_mib")),
+                gpu_power_avg_watts=to_opt_float(row.get("gpu_power_avg_watts")),
+                gpu_power_min_watts=to_opt_float(row.get("gpu_power_min_watts")),
+                gpu_power_max_watts=to_opt_float(row.get("gpu_power_max_watts")),
+            )
+
+            if required_prompt_ids is not None and len(outcomes) == len(required_prompt_ids):
+                break
+
+    if required_prompt_ids is not None:
+        missing_prompt_ids = sorted(required_prompt_ids - set(outcomes))
+        if missing_prompt_ids:
+            preview = ", ".join(str(prompt_id) for prompt_id in missing_prompt_ids[:10])
+            raise ValueError(
+                f"Cached outcome CSV {csv_path} is missing {len(missing_prompt_ids)} "
+                f"required prompt ids. First missing ids: {preview}"
+            )
+    if not outcomes:
+        raise ValueError(f"No cached outcomes loaded from {csv_path}")
+    return outcomes
+
+
 def build_prompt(question: str, choices: Sequence[str]) -> str:
     joined_choices = "\n".join(
         f"{label}. {choice}" for label, choice in zip(CHOICE_LABELS, choices)
@@ -836,6 +1062,57 @@ def parse_hidden_sizes(raw: Any, *, arg_name: str) -> List[int]:
     return sizes
 
 
+def describe_observation_features(observations: ObservationStore) -> Dict[str, Any]:
+    if observations.kind == "embedding":
+        shape = observations.observation_space.shape
+        feature_dim = int(shape[0]) if shape is not None else None
+        return {
+            "observation_kind": "frozen_embedding",
+            "encoder_feature_dim": feature_dim,
+        }
+
+    input_space = observations.observation_space.spaces["input_ids"]
+    return {
+        "observation_kind": "tokenized_transformer_input",
+        "encoder_feature_dim": "transformer_hidden_size",
+        "sequence_length": int(input_space.shape[0]),
+    }
+
+
+def build_router_architecture_summary(
+    *,
+    args: argparse.Namespace,
+    policy_name: str,
+    actor_hidden_sizes: Sequence[int],
+    critic_hidden_sizes: Sequence[int],
+    model_pool: Sequence[str],
+    observations: ObservationStore,
+) -> Dict[str, Any]:
+    feature_info = describe_observation_features(observations)
+    feature_dim = feature_info["encoder_feature_dim"]
+    action_dim = len(model_pool)
+    actor_layers: List[Any] = [feature_dim, *actor_hidden_sizes, action_dim]
+    critic_layers: List[Any] = [feature_dim, *critic_hidden_sizes, 1]
+    return {
+        "name": ROUTER_ARCHITECTURE_NAME,
+        "policy_name": policy_name,
+        "encoder_training_mode": args.encoder_training_mode,
+        "encoder_name": args.encoder_name,
+        "encoder_max_length": args.encoder_max_length,
+        "embedding_normalize": args.embedding_normalize,
+        "actor_mlp_layers": actor_layers,
+        "actor_mlp_linear_layer_count": len(actor_hidden_sizes) + 1,
+        "actor_mlp_hidden_layer_count": len(actor_hidden_sizes),
+        "critic_mlp_layers": critic_layers,
+        "critic_mlp_linear_layer_count": len(critic_hidden_sizes) + 1,
+        "critic_mlp_hidden_layer_count": len(critic_hidden_sizes),
+        "action_dim": action_dim,
+        "action_labels": list(model_pool),
+        "policy_output": "softmax over actor logits via SB3 CategoricalDistribution",
+        **feature_info,
+    }
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.encoder_training_mode not in ENCODER_MODE_CHOICES:
         raise ValueError(
@@ -936,7 +1213,7 @@ def _load_yaml_defaults(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train an online PPO policy for LLM routing with reward = "
+            "Train a PPO policy for LLM routing with reward = "
             "alpha*correct - beta*latency - gamma*energy and full W&B logging."
         )
     )
@@ -960,10 +1237,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-pool",
         default=(
-            "llama3-chatqa:8b,llama3.2:3b,qwen2.5:3b,dolphin3:8b,granite3.3:8b,"
+            "llama3-chatqa:8b,llama3.2:3b,qwen2.5:7b,dolphin3:8b,granite4:3b,"
             "mathstral:7b,meditron:7b,sailor2:8b"
         ),
         help="Comma-separated model names available to the router.",
+    )
+    parser.add_argument(
+        "--outcome-source",
+        choices=OUTCOME_SOURCE_CHOICES,
+        default="cached",
+        help=(
+            "Use cached benchmark CSV outcomes for each action, or query Ollama online. "
+            "Cached mode expects files named '<model>-<split>.csv'."
+        ),
+    )
+    parser.add_argument(
+        "--cached-output-dir",
+        default="model_outputs",
+        help="Directory containing cached benchmark CSV files used when outcome-source=cached.",
     )
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
     parser.add_argument("--timeout", type=float, default=300.0, help="Per-request timeout (s).")
@@ -1005,13 +1296,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=float, default=0.5, help="Max grad norm.")
     parser.add_argument(
         "--actor-hidden-sizes",
-        default="256,128",
-        help="Comma-separated hidden sizes for the actor head MLP.",
+        default=",".join(str(size) for size in DEFAULT_ACTOR_HIDDEN_SIZES),
+        help=(
+            "Comma-separated hidden sizes for the actor head MLP. The default is "
+            "the proposal architecture: encoder -> 256 -> 128 -> model logits "
+            "(three linear layers including the output layer)."
+        ),
     )
     parser.add_argument(
         "--critic-hidden-sizes",
-        default="256,64",
-        help="Comma-separated hidden sizes for the critic head MLP.",
+        default=",".join(str(size) for size in DEFAULT_CRITIC_HIDDEN_SIZES),
+        help=(
+            "Comma-separated hidden sizes for the PPO critic MLP. The critic is "
+            "training-only and follows the existing PPO value-head shape by default."
+        ),
     )
     parser.add_argument("--n-envs", type=int, default=1, help="Number of vectorized envs.")
     parser.add_argument("--ppo-device", default="auto", help="SB3 torch device.")
@@ -1136,22 +1434,56 @@ def main() -> None:
         latency_norm_s=args.latency_norm_s,
         energy_norm_j=args.energy_norm_j,
     )
-    provider_config = OnlineProviderConfig(
-        host=args.host,
-        timeout_s=args.timeout,
-        gpu_layers=args.gpu_layers,
-        gpu_device=args.gpu_device,
-        power_sample_interval_s=args.power_sample_interval,
-    )
+    provider_config: Optional[OnlineProviderConfig] = None
+    train_cached_store: Optional[CachedOutcomeStore] = None
+    val_cached_store: Optional[CachedOutcomeStore] = None
+    outcome_provider_summary: Dict[str, Any] = {"source": args.outcome_source}
+
+    if args.outcome_source == "cached":
+        cached_output_dir = Path(args.cached_output_dir)
+        train_cached_store = CachedOutcomeStore.from_dir(
+            config=CachedProviderConfig(
+                output_dir=cached_output_dir,
+                split=args.train_split,
+            ),
+            model_pool=model_pool,
+            required_prompt_ids=[record.prompt_id for record in train_records],
+        )
+        outcome_provider_summary["train_cache"] = train_cached_store.describe()
+        if len(val_records) > 0:
+            val_cached_store = CachedOutcomeStore.from_dir(
+                config=CachedProviderConfig(
+                    output_dir=cached_output_dir,
+                    split=args.val_split,
+                ),
+                model_pool=model_pool,
+                required_prompt_ids=[record.prompt_id for record in val_records],
+            )
+            outcome_provider_summary["val_cache"] = val_cached_store.describe()
+    else:
+        provider_config = OnlineProviderConfig(
+            host=args.host,
+            timeout_s=args.timeout,
+            gpu_layers=args.gpu_layers,
+            gpu_device=args.gpu_device,
+            power_sample_interval_s=args.power_sample_interval,
+        )
+        outcome_provider_summary["online_config"] = asdict(provider_config)
+
+    def make_train_provider() -> OutcomeProvider:
+        if args.outcome_source == "cached":
+            assert train_cached_store is not None
+            return CachedOutcomeProvider(train_cached_store)
+        assert provider_config is not None
+        return OnlineOllamaProvider(provider_config)
 
     def make_env(env_seed: int):
         def _factory():
-            provider = OnlineOllamaProvider(provider_config)
             return RouterBanditEnv(
                 records=train_records,
                 observations=train_observations,
                 model_pool=model_pool,
-                provider=provider,
+                provider=make_train_provider(),
                 reward_config=reward_config,
                 seed=env_seed,
             )
@@ -1170,6 +1502,14 @@ def main() -> None:
                 "features_extractor_kwargs": {"encoder_name": args.encoder_name},
             }
         )
+    architecture = build_router_architecture_summary(
+        args=args,
+        policy_name=policy_name,
+        actor_hidden_sizes=actor_hidden_sizes,
+        critic_hidden_sizes=critic_hidden_sizes,
+        model_pool=model_pool,
+        observations=train_observations,
+    )
     ppo_model = PPO(
         policy_name,
         env,
@@ -1198,6 +1538,8 @@ def main() -> None:
         run_config = vars(args).copy()
         run_config["model_pool"] = model_pool
         run_config["reward_config"] = asdict(reward_config)
+        run_config["router_architecture"] = architecture
+        run_config["outcome_provider"] = outcome_provider_summary
         run_config["train_records"] = len(train_records)
         run_config["val_records"] = len(val_records)
         run = wandb.init(
@@ -1210,7 +1552,12 @@ def main() -> None:
 
     eval_runner = None
     if len(val_records) > 0:
-        eval_provider = OnlineOllamaProvider(provider_config)
+        if args.outcome_source == "cached":
+            assert val_cached_store is not None
+            eval_provider = CachedOutcomeProvider(val_cached_store)
+        else:
+            assert provider_config is not None
+            eval_provider = OnlineOllamaProvider(provider_config)
         eval_runner = RouterEvaluator(
             records=val_records,
             observations=val_observations,
@@ -1248,6 +1595,8 @@ def main() -> None:
         "encoder_training_mode": args.encoder_training_mode,
         "encoder_name": args.encoder_name,
         "encoder_max_length": args.encoder_max_length,
+        "router_architecture": architecture,
+        "outcome_provider": outcome_provider_summary,
     }
 
     if eval_runner is not None:
