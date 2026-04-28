@@ -1,0 +1,52 @@
+program: scripts/train_router_ppo.py
+name: router-ppo-focused-highbudget
+method: bayes
+metric:
+  goal: maximize
+  name: eval/accuracy_per_joule
+parameters:
+  train-limit:
+    values: [2048, 4096, 8192]
+  val-limit:
+    values: [256, 512, 1024]
+  learning-rate:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-3
+  n-steps:
+    values: [512, 1024, 2048]
+  batch-size:
+    values: [64, 128, 256]
+  ppo-epochs:
+    values: [5, 10, 20]
+  total-timesteps:
+    value: 300000
+  encoder-training-mode:
+    value: frozen
+  reward-alpha:
+    value: 1.0
+  reward-beta:
+    value: 0.2
+  reward-gamma:
+    value: 0.2
+  outcome-source:
+    value: cached
+  train-split:
+    value: test
+  val-split:
+    value: validation
+  cached-output-dir:
+    value: model_outputs
+  wandb-project:
+    value: llm-router
+  wandb-mode:
+    value: online
+  checkpoint-metric:
+    value: eval/accuracy_per_joule
+  encoder-name:
+    value: sentence-transformers/all-MiniLM-L6-v2
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}

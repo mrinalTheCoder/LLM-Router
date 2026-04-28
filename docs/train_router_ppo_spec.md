@@ -207,3 +207,56 @@ Override from CLI:
 ```bash
 python scripts/train_router_ppo.py --config-yaml path/to/router_train.yaml --learning-rate 1e-4 --reward-beta 0.3
 ```
+
+---
+
+## 8. W&B sweep setup (focused + high budget)
+
+This repo includes a ready-to-run sweep config:
+
+- `scripts/wandb_sweep_router_ppo_focused.yaml`
+
+### 8.1 Sweep design
+
+- **Fixed constraints**
+  - `encoder-training-mode=frozen`
+  - `reward-alpha=1.0`
+  - `reward-beta=0.2`
+  - `reward-gamma=0.2`
+  - `total-timesteps=300000` (high fixed training budget)
+- **Swept parameters**
+  - `train-limit`
+  - `val-limit`
+  - `learning-rate`
+  - `n-steps`
+  - `batch-size`
+  - `ppo-epochs`
+- **Optimization metric**
+  - `eval/accuracy_per_joule` (maximize)
+
+### 8.2 Launch commands
+
+Create a sweep:
+
+```bash
+wandb sweep --project llm-router scripts/wandb_sweep_router_ppo_focused.yaml
+```
+
+Run an agent:
+
+```bash
+wandb agent <entity_or_user>/llm-router/<sweep_id>
+```
+
+Or use the helper script to create and run in one step:
+
+```bash
+bash scripts/run_wandb_sweep_router_ppo.sh
+```
+
+Useful overrides:
+
+```bash
+WANDB_ENTITY=my-team AGENT_COUNT=40 bash scripts/run_wandb_sweep_router_ppo.sh
+SWEEP_ID=my-team/llm-router/abc123 AGENT_COUNT=10 bash scripts/run_wandb_sweep_router_ppo.sh
+```
