@@ -1,0 +1,55 @@
+program: scripts/train_router_ppo.py
+name: router-ppo-reward-weights-grid81
+method: grid
+metric:
+  goal: maximize
+  name: eval/accuracy_per_joule
+parameters:
+  # Fixed to the provided training command.
+  batch-size:
+    value: 128
+  cached-output-dir:
+    value: model_outputs
+  checkpoint-metric:
+    value: eval/accuracy_per_joule
+  encoder-name:
+    value: sentence-transformers/all-MiniLM-L6-v2
+  encoder-training-mode:
+    value: frozen
+  learning-rate:
+    value: 7.532383125475834e-05
+  n-steps:
+    value: 1024
+  outcome-source:
+    value: cached
+  ppo-epochs:
+    value: 5
+  reward-alpha:
+    value: 1.0
+  reward-beta:
+    values: [0.0, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+  reward-gamma:
+    values: [0.0, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+  latency-norm-s:
+    value: 3.0
+  energy-norm-j:
+    value: 200.0
+  total-timesteps:
+    value: 300000
+  train-limit:
+    value: 8192
+  train-split:
+    value: test
+  val-limit:
+    value: 512
+  val-split:
+    value: validation
+  wandb-mode:
+    value: online
+  wandb-project:
+    value: llm-router
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}
