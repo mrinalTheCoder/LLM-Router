@@ -215,7 +215,8 @@ legend_handles = [
     plt.scatter([], [], s=140, color=CLOUD_COLOR, marker='D', label='Cloud LLM API'),
     plt.scatter([], [], s=280, color=ROUTER_COLOR, marker='*', label='PPO Router (ours)'),
 ]
-ax.legend(handles=legend_handles, loc='lower right', fontsize=9,
+ax.legend(handles=legend_handles, loc='lower right',
+          bbox_to_anchor=(0.92, 0.02), fontsize=13.7,
           framealpha=0.9, edgecolor='#CCCCCC', frameon=True)
 
 # ── Cost-gap annotation ───────────────────────────────────────────────────────
